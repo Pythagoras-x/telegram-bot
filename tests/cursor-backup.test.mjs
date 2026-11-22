@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -95,92 +95,52 @@ test("restore normalizes supported legacy cursor files to version 1", async () =
   });
 });
 
-test("restore validates backup schema and target ownership before overwriting live cursor", async () => {
+test("rejects backup and restore when symbolic-link aliases resolve to the same file", async () => {
   await withTempDir(async (directory) => {
-    const cursorFile = path.join(directory, "cursor.json");
-    const backupFile = path.join(directory, "backup.json");
-    const lockFile = path.join(directory, "poller.lock");
+    const realDir = path.join(directory, "real");
+    const linkDir = path.join(directory, "alias");
+    await mkdir(realDir);
+    await symlink(realDir, linkDir);
 
-    const liveContent = `${JSON.stringify({
+    const cursorFile = path.join(realDir, "cursor.json");
+    const lockFile = path.join(realDir, "poller.lock");
+    const raw = `${JSON.stringify({
       version: 1,
       updatedAt: "2026-09-29T00:00:00.000Z",
-      network: "testnet",
-      targets: {
-        market: {
-          cursor: "live-market-cursor",
-          lastEventLedger: 100,
-          contractId: "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
-        },
-      },
+      targets: { market: { cursor: "live-cursor", lastEventLedger: 99 } },
     }, null, 2)}\n`;
-    await writeFile(cursorFile, liveContent);
+    await writeFile(cursorFile, raw);
 
-    // 1. Empty targets in backup must be rejected
-    await writeFile(backupFile, JSON.stringify({ version: 1, updatedAt: "2026-09-29T00:00:00.000Z", targets: {} }));
+    // 1. Direct file symlink alias
+    const fileAlias = path.join(directory, "cursor-link.json");
+    await symlink(cursorFile, fileAlias);
     await assert.rejects(
-      restoreCursor({ cursorFile, backupFile, lockFile, force: true }),
-      /no targets/,
+      restoreCursor({ cursorFile, backupFile: fileAlias, lockFile, force: true }),
+      /must be different/,
     );
-    assert.equal(await readFile(cursorFile, "utf8"), liveContent);
-
-    // 2. Unrelated target key in backup must be rejected even with --force
-    await writeFile(backupFile, JSON.stringify({
-      version: 1,
-      updatedAt: "2026-09-29T00:00:00.000Z",
-      targets: { squad: { cursor: "other-cursor", lastEventLedger: 50 } },
-    }));
     await assert.rejects(
-      restoreCursor({ cursorFile, backupFile, lockFile, force: true }),
-      /does not match live cursor targets/,
+      backupCursor({ cursorFile, backupFile: fileAlias, force: true }),
+      /must be different/,
     );
-    assert.equal(await readFile(cursorFile, "utf8"), liveContent);
+    // Live cursor must remain untouched and lock must not be left behind
+    assert.equal(await readFile(cursorFile, "utf8"), raw);
+    assert.equal(await exists(lockFile), false);
 
-    // 3. Mismatched contractId ownership must be rejected
-    await writeFile(backupFile, JSON.stringify({
-      version: 1,
-      updatedAt: "2026-09-29T00:00:00.000Z",
-      targets: {
-        market: {
-          cursor: "foreign-cursor",
-          lastEventLedger: 50,
-          contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        },
-      },
-    }));
+    // 2. Directory symlink alias (differently spelled path to same file)
+    const dirAliasCursor = path.join(linkDir, "cursor.json");
     await assert.rejects(
-      restoreCursor({ cursorFile, backupFile, lockFile, force: true }),
-      /contractId/,
+      restoreCursor({ cursorFile, backupFile: dirAliasCursor, lockFile, force: true }),
+      /must be different/,
     );
-    assert.equal(await readFile(cursorFile, "utf8"), liveContent);
+    assert.equal(await readFile(cursorFile, "utf8"), raw);
 
-    // 4. Mismatched network ownership must be rejected
-    await writeFile(backupFile, JSON.stringify({
-      version: 1,
-      updatedAt: "2026-09-29T00:00:00.000Z",
-      network: "public",
-      targets: { market: { cursor: "mainnet-cursor", lastEventLedger: 50 } },
-    }));
+    // 3. Directory symlink alias when destination file does not exist yet
+    const newInReal = path.join(realDir, "new-backup.json");
+    const newInLink = path.join(linkDir, "new-backup.json");
+    await writeFile(newInReal, raw);
     await assert.rejects(
-      restoreCursor({ cursorFile, backupFile, lockFile, force: true }),
-      /network/,
+      restoreCursor({ cursorFile: newInLink, backupFile: newInReal, lockFile, force: true }),
+      /must be different/,
     );
-    assert.equal(await readFile(cursorFile, "utf8"), liveContent);
-
-    // 5. Matching ownership succeeds
-    await writeFile(backupFile, JSON.stringify({
-      version: 1,
-      updatedAt: "2026-09-29T00:00:00.000Z",
-      network: "testnet",
-      targets: {
-        market: {
-          cursor: "valid-backup-cursor",
-          lastEventLedger: 95,
-          contractId: "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
-        },
-      },
-    }));
-    await restoreCursor({ cursorFile, backupFile, lockFile, force: true });
-    const restored = JSON.parse(await readFile(cursorFile, "utf8"));
-    assert.equal(restored.targets.market.cursor, "valid-backup-cursor");
   });
 });
